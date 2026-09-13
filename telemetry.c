@@ -3,16 +3,20 @@
  *
  * Title   : Real-time Jetstream telemetry logger.
  *
- * Desc    : Producer/Consumer over a bounded circular buffer, built
- *           on the queue from assignment 1.
- *             Thread 1 (producer) : libwebsockets client, event-driven
- *             Thread 2 (consumer) : parses JSON, classifies "kind"
- *             Thread 3 (monitor)  : strict 1 Hz CSV logger
+ * Desc    : Producer/Consumer over a bounded circular buffer, built on
+ *           the queue from assignment 1.
+ *             Thread 1 (producer.c) : libwebsockets client, event-driven
+ *             Thread 2 (consumer.c) : parses JSON, classifies "kind"
+ *             Thread 3 (monitor.c)  : strict 1 Hz CSV logger
+ *
+ *           This file holds main and the shared per-kind counters.
  *
  * Usage   : ./telemetry [-o logfile] [-d seconds]
  *
- * Compile : make    (gcc -O2 -Wall -lwebsockets -lcjson -lpthread -lm)
+ * Compile : make  (gcc -O2 -Wall -lwebsockets -lcjson -lpthread -lm)
  */
+
+#include "telemetry.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -23,11 +27,36 @@
 #include <sys/mman.h>
 #include <time.h>
 
-#include "telemetry.h"
+queue      *g_fifo;
+atomic_int  g_running     = 1;
+atomic_int  g_failed      = 0;
+const char *g_log_path    = LOG_PATH;
+long        g_run_seconds = 0;
 
-atomic_int g_running = 1;
-atomic_int g_failed  = 0;
-stats_t    g_wait;    /* enqueue -> dequeue wait time, in us */
+/* ------------------------------------------------------------------ *
+ *  The four per-kind counters
+ *
+ *  Global and mutex-protected, as the assignment requires. The consumer
+ *  increments; the monitor snapshots and zeroes once a second.
+ * ------------------------------------------------------------------ */
+
+static unsigned long   kind_count[K_NUM];
+static pthread_mutex_t kind_lock;
+
+void counters_count(int kind) {
+    pthread_mutex_lock(&kind_lock);
+    kind_count[kind]++;
+    pthread_mutex_unlock(&kind_lock);
+}
+
+void counters_snapshot(unsigned long out[K_NUM]) {
+    pthread_mutex_lock(&kind_lock);
+    memcpy(out, kind_count, sizeof(kind_count));
+    memset(kind_count, 0, sizeof(kind_count));
+    pthread_mutex_unlock(&kind_lock);
+}
+
+// main
 
 static void usage(const char *prog) {
     fprintf(stderr,
@@ -41,16 +70,12 @@ static void usage(const char *prog) {
 int main(int argc, char *argv[]) {
     int i;
 
-    const char *log_path    = LOG_PATH;
-    long        run_seconds = 0;
-
-    // Parse command line arguments
-    // configure output log file and run duration
+    /* Parse command line arguments */
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-o") && i + 1 < argc) {
-            log_path = argv[++i];
+            g_log_path = argv[++i];
         } else if (!strcmp(argv[i], "-d") && i + 1 < argc) {
-            run_seconds = atol(argv[++i]);
+            g_run_seconds = atol(argv[++i]);
         } else {
             usage(argv[0]);
             return 1;
@@ -73,39 +98,41 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Keep every page resident: a major fault in the monitor thread
-       is a millisecond of jitter we do not need. */
+    /* Keep every page resident: a major fault in the monitor thread is
+       a millisecond of jitter we do not need. */
     if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0)
         fprintf(stderr, "Warning: mlockall failed (%s), continuing.\n",
                 strerror(errno));
 
-    /* Initialise shared queue and statistics */
-    queue *fifo = queueInit();
-    if (!fifo) {
+    /* Initialise shared queue and counters */
+    g_fifo = queueInit();
+    if (!g_fifo) {
         fprintf(stderr, "queueInit failed.\n");
         return 1;
     }
-    stats_init(&g_wait);
-    counters_init();
 
-    printf("Logging to %s, queue %d slots x %d B (%.1f MB).\n", log_path,
-           QUEUESIZE, SLOTSIZE, (double)sizeof(queue) / (1024.0 * 1024.0));
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_setprotocol(&attr, PTHREAD_PRIO_INHERIT);
+    pthread_mutex_init(&kind_lock, &attr);
+    pthread_mutexattr_destroy(&attr);
 
-    /* One argument bundle per thread, as in assignment 1 */
-    thread_args targs[3];
-    pthread_t   prod_t, cons_t, mon_t;
-
-    for (i = 0; i < 3; i++) {
-        targs[i].fifo        = fifo;
-        targs[i].log_path    = log_path;
-        targs[i].run_seconds = run_seconds;
-        targs[i].id          = i;
+    /* The websocket context is created here, before any thread exists,
+       and destroyed below once they are all joined. */
+    if (stream_init() != 0) {
+        fprintf(stderr, "stream_init failed.\n");
+        return 1;
     }
 
+    printf("Logging to %s, queue %d slots x %d B (%.1f MB).\n", g_log_path,
+           QUEUESIZE, SLOTSIZE, (double)sizeof(queue) / (1024.0 * 1024.0));
+
+    pthread_t prod_t, cons_t, mon_t;
+
     /* Consumer first, so it is ready before any frame arrives */
-    if (pthread_create(&cons_t, NULL, consumer, &targs[1]) != 0 ||
-        pthread_create(&prod_t, NULL, producer, &targs[0]) != 0 ||
-        pthread_create(&mon_t, NULL, monitor, &targs[2]) != 0) {
+    if (pthread_create(&cons_t, NULL, consumer, NULL) != 0 ||
+        pthread_create(&prod_t, NULL, producer, NULL) != 0 ||
+        pthread_create(&mon_t, NULL, monitor, NULL) != 0) {
         fprintf(stderr, "pthread_create failed.\n");
         return 1;
     }
@@ -121,9 +148,9 @@ int main(int argc, char *argv[]) {
 
     g_running = 0;
 
-    /* Producer cannot be cancelled safely from inside libwebsockets,
+    /* The producer cannot be cancelled safely from inside libwebsockets,
        so wake its event loop and let it unwind itself. */
-    producer_wake();
+    stream_wake();
     pthread_join(prod_t, NULL);
     pthread_join(mon_t, NULL);
 
@@ -132,32 +159,22 @@ int main(int argc, char *argv[]) {
     pthread_cancel(cons_t);
     pthread_join(cons_t, NULL);
 
-    /* Final statistics */
-    unsigned long parsed, drops, oversize, badjson;
-    counters_totals(&parsed, &drops, &oversize, &badjson);
-
-    /* The CSV samples occupancy once a second, as specified, so it
-       misses any burst that arrives and drains in between. The
-       high-water mark does not. */
-    pthread_mutex_lock(fifo->mut);
-    long peak = queuePeak(fifo);
-    pthread_mutex_unlock(fifo->mut);
-
-    stats_print(&g_wait, "Queue Wait Time (enqueue -> dequeue)", "us");
-    printf("  Messages parsed  : %lu\n", parsed);
-    printf("  Dropped (full)   : %lu\n", drops);
-    printf("  Oversize frames  : %lu\n", oversize);
-    printf("  Malformed JSON   : %lu\n", badjson);
-    printf("  Peak buffer use  : %ld / %d slots (%.2f%%)\n\n", peak, QUEUESIZE,
-           100.0 * (double)peak / (double)QUEUESIZE);
+    /* Final statistics. Every thread is joined, so the single-writer
+       counters can be read without a lock. */
+    wait_stats_print();
+    printf("  Messages parsed  : %lu\n", g_parsed);
+    printf("  Dropped (full)   : %lu\n", g_drops);
+    printf("  Oversize frames  : %lu\n", g_oversize);
+    printf("  Malformed JSON   : %lu\n", g_badjson);
+    printf("  Peak buffer use  : %ld / %d slots (%.2f%%)\n\n", g_fifo->peak,
+           QUEUESIZE, 100.0 * (double)g_fifo->peak / (double)QUEUESIZE);
 
     /* Cleanup */
-    pthread_mutex_destroy(&g_wait.lock);
-    counters_destroy();
-    cpu_close();
-    queueDelete(fifo);
+    stream_destroy();
+    pthread_mutex_destroy(&kind_lock);
+    queueDelete(g_fifo);
 
-    /* Non-zero tells a supervisor (systemd Restart=on-failure, a shell
-       loop) that the capture aborted rather than finishing cleanly. */
+    /* Non-zero tells a supervisor (systemd Restart=on-failure) that the
+       capture aborted rather than finishing cleanly. */
     return g_failed ? 1 : 0;
 }

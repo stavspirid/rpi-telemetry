@@ -6,24 +6,82 @@
  *           appends one CSV line to the log file.
  *
  *           Timing uses clock_nanosleep with TIMER_ABSTIME against a
- *           deadline advanced by += 1s, never "now + 1s". A late
- *           wakeup does not push the next deadline out, so error
- *           cannot accumulate: drift is zero by construction.
+ *           deadline advanced by += 1s, never "now + 1s". A late wakeup
+ *           does not push the next deadline out, so error cannot
+ *           accumulate: drift is zero by construction.
  *
- *           The one exception is an overrun, where the deadline has
- *           already passed by the time we get to it. See the overrun
- *           guard at the bottom of the loop.
+ *           Also owns the /proc/stat CPU sampling, since this is the
+ *           only thread that reads it.
  */
 
 #include <errno.h>
-#include <pthread.h>
+#include <fcntl.h>
 #include <sched.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "telemetry.h"
 
+/* ------------------------------------------------------------------ *
+ *  CPU usage, sampled from /proc/stat
+ *
+ *  Opened once and re-read with pread(fd, ..., 0): one syscall per
+ *  second, no stdio buffering, no allocation.
+ * ------------------------------------------------------------------ */
+
+typedef struct {
+    unsigned long long total;
+    unsigned long long idle;
+} cpu_sample;
+
+static int stat_fd = -1;
+
+static int cpu_read(cpu_sample *s) {
+    char               buf[256];
+    unsigned long long v[10];
+    ssize_t            n;
+    int                fields, i;
+
+    if (stat_fd < 0) {
+        stat_fd = open("/proc/stat", O_RDONLY | O_CLOEXEC);
+        if (stat_fd < 0) return -1;
+    }
+
+    n = pread(stat_fd, buf, sizeof(buf) - 1, 0);
+    if (n <= 0) return -1;
+    buf[n] = '\0';
+
+    memset(v, 0, sizeof(v));
+    fields = sscanf(
+        buf, "cpu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu", &v[0],
+        &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7], &v[8], &v[9]);
+    if (fields < 4) return -1;
+
+    s->total = 0;
+    for (i = 0; i < fields; i++) s->total += v[i];
+
+    s->idle = v[3] + (fields > 4 ? v[4] : 0ULL); /* idle + iowait */
+
+    return 0;
+}
+
+static double cpu_usage_pct(const cpu_sample *prev, const cpu_sample *cur) {
+    unsigned long long d_total, d_idle;
+
+    if (cur->total <= prev->total) return 0.0;
+
+    d_total = cur->total - prev->total;
+    d_idle  = cur->idle - prev->idle;
+    if (d_idle > d_total) d_idle = d_total;
+
+    return 100.0 * (double)(d_total - d_idle) / (double)d_total;
+}
+
+/* ------------------------------------------------------------------ *
+ *  The thread
+ * ------------------------------------------------------------------ */
 
 static void set_realtime_priority(void) {
 #if MONITOR_RT_PRIO > 0
@@ -39,33 +97,27 @@ static void set_realtime_priority(void) {
 #endif
 }
 
-void *monitor(void *args) {
-    thread_args *targs = (thread_args *)args;
-    queue       *fifo  = targs->fifo;
-
-    struct timespec next;
-    struct timespec now;
-    cpu_sample      prev;
-    cpu_sample      cur;
+void *monitor(void *unused) {
+    struct timespec next, now;
+    cpu_sample      prev, cur;
     unsigned long   count[K_NUM];
     long            occupied;
-    double          occupancy;
-    double          cpu_pct;
+    double          occupancy, cpu_pct;
     FILE           *f;
-    long            written      = 0;
-    long            overruns     = 0; /* deadlines that had already passed */
-    long            skipped_secs = 0;
-    long            worst_skip   = 0;
+    long            written  = 0;
+    long            overruns = 0, skipped = 0, worst = 0;
     int             rc;
+
+    (void)unused;
 
     set_realtime_priority();
 
-    f = fopen(targs->log_path, "a");
+    f = fopen(g_log_path, "a");
     if (!f) {
         perror("monitor: fopen");
         g_failed  = 1;
         g_running = 0;
-        producer_wake();
+        stream_wake();
         return NULL;
     }
     setvbuf(f, NULL, _IOLBF, 0); /* flush on every newline */
@@ -91,18 +143,18 @@ void *monitor(void *args) {
         }
 
         /*
-         * Actual wake time. Because the ideal deadline is always a
-         * whole second, jitter is implicit in the nanoseconds field:
-         * positive jitter is tv_nsec, negative is tv_nsec - 1e9.
+         * Actual wake time. Because the ideal deadline is always a whole
+         * second, jitter is implicit in the nanoseconds field: positive
+         * jitter is tv_nsec, negative is tv_nsec - 1e9.
          */
         clock_gettime(CLOCK_REALTIME, &now);
 
         counters_snapshot(count);
 
-        /* Caller-locks convention, same as the producer/consumer. */
-        pthread_mutex_lock(fifo->mut);
-        occupied = queueCount(fifo);
-        pthread_mutex_unlock(fifo->mut);
+        /* Caller-locks convention, same as producer and consumer. */
+        pthread_mutex_lock(g_fifo->mut);
+        occupied = queueCount(g_fifo);
+        pthread_mutex_unlock(g_fifo->mut);
         occupancy = 100.0 * (double)occupied / (double)QUEUESIZE;
 
         cpu_pct = 0.0;
@@ -111,14 +163,12 @@ void *monitor(void *args) {
             prev    = cur;
         }
 
-        fprintf(f, "%ld,%ld,%lu,%lu,%lu,%lu,%.2f,%.2f\n",
-                (long)now.tv_sec, (long)now.tv_nsec,
-                count[K_COMMIT], count[K_IDENTITY],
-                count[K_ACCOUNT], count[K_INFO],
-                occupancy, cpu_pct);
+        fprintf(f, "%ld,%ld,%lu,%lu,%lu,%lu,%.2f,%.2f\n", (long)now.tv_sec,
+                (long)now.tv_nsec, count[K_COMMIT], count[K_IDENTITY],
+                count[K_ACCOUNT], count[K_INFO], occupancy, cpu_pct);
 
         written++;
-        if (targs->run_seconds > 0 && written >= targs->run_seconds) {
+        if (g_run_seconds > 0 && written >= g_run_seconds) {
             g_running = 0;
             break;
         }
@@ -126,35 +176,24 @@ void *monitor(void *args) {
         next.tv_sec += 1; /* absolute deadline => zero drift */
 
         /*
-         * Overrun guard.
-         *
-         * If the deadline we just set is ALREADY in the past -- a
-         * scheduling stall, an NTP step, a suspended process --
-         * clock_nanosleep returns instantly and the loop fires
-         * back-to-back trying to catch up. That is wrong twice over.
-         * It stamps several rows with the same Seconds value (a 4 s
-         * stall produced four rows 300 us apart, all stamped the same
-         * second, while three seconds vanished from the column). And
-         * it breaks the invariant that the ideal deadline is always a
-         * whole second -- the invariant that lets tv_nsec be read as
-         * signed jitter. A row written 3.68 s late carried
-         * tv_nsec = 682240320, which that reading turns into
-         * -317.8 ms: a large overrun plotted as a small NEGATIVE
-         * jitter, in the one plot whose whole purpose is to show it.
-         *
-         * So re-align to the next whole second in the future instead.
-         * Every row that is written then sits on the grid and its
-         * tv_nsec is true jitter; the seconds we could not sample are
-         * simply absent from the Seconds column, where post-processing
-         * can see them as a gap.
+         * Overrun guard. If that deadline has already passed -- a
+         * scheduling stall, an NTP step, a suspended process -- firing
+         * back-to-back to catch up would stamp several rows with the
+         * same second, and would break the invariant that the ideal
+         * deadline is always a whole second. That invariant is what lets
+         * tv_nsec be read as signed jitter, so a row written 3.68 s late
+         * (tv_nsec = 682240320) would be plotted as -317.8 ms: a large
+         * overrun shown as a small negative jitter. Re-align to the next
+         * whole second instead; the seconds that could not be sampled
+         * are then visible as a gap in the Seconds column.
          */
         clock_gettime(CLOCK_REALTIME, &now);
         if (next.tv_sec <= now.tv_sec) {
-            long skipped = (long)(now.tv_sec - next.tv_sec) + 1;
+            long n = (long)(now.tv_sec - next.tv_sec) + 1;
 
             overruns++;
-            skipped_secs += skipped;
-            if (skipped > worst_skip) worst_skip = skipped;
+            skipped += n;
+            if (n > worst) worst = n;
 
             next.tv_sec  = now.tv_sec + 1;
             next.tv_nsec = 0;
@@ -162,16 +201,17 @@ void *monitor(void *args) {
     }
 
     fclose(f);
+    if (stat_fd >= 0) close(stat_fd);
 
     if (overruns)
         fprintf(stderr,
                 "monitor: %ld deadline overrun(s), %ld second(s) skipped, "
                 "worst %ld s. Every logged row is still on the whole "
                 "second; the gaps are visible in the Seconds column.\n",
-                overruns, skipped_secs, worst_skip);
+                overruns, skipped, worst);
 
     /* Let main out of its wait loop if we stopped on our own. */
-    producer_wake();
+    stream_wake();
 
     return NULL;
 }

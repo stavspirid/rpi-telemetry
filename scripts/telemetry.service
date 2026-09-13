@@ -1,0 +1,29 @@
+# Unattended capture. Install on the Pi:
+#   sudo cp scripts/telemetry.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now telemetry
+#
+# Restart=on-failure pairs with the non-zero exit main() now returns when
+# the producer or monitor aborts, so a dead context restarts the capture
+# instead of leaving 0,0,0,0 rows for the rest of the day.
+[Unit]
+Description=Jetstream real-time telemetry logger
+After=network-online.target chrony.service
+Wants=network-online.target
+# No hardware RTC on a Pi Zero W: the monitor sleeps on absolute
+# CLOCK_REALTIME deadlines, so do not start until the clock is real.
+After=time-sync.target
+Requires=time-sync.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/rtes-jetstream
+ExecStart=/home/pi/rtes-jetstream/telemetry -o /home/pi/rtes-jetstream/metrics_log.txt
+Restart=on-failure
+RestartSec=5
+LimitRTPRIO=60
+LimitMEMLOCK=infinity
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target

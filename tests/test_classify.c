@@ -1,44 +1,26 @@
-/* Unit test for consumer.c's classify().
+/* Unit test for classify().
  *
- * Ported from a harness written against a different implementation of
- * this assignment (jsmn + a src/ layout + a msg_kind_t enum). This
- * project uses cJSON, a flat layout and the K_* enum from telemetry.h,
- * so the cases are the same but the plumbing is not:
+ * Includes consumer.c directly (not linked) so the harness links only
+ * what classify() actually needs: no libwebsockets, no main().
  *
- *   - classify() is a normal function declared in telemetry.h, so this
- *     links against consumer.o instead of #include-ing consumer.c to
- *     reach a static.
- *   - There is no jsmn token pool, so no g_toks/g_ntoks to preallocate;
- *     cJSON allocates per parse and classify() frees before returning.
- *
- * Build & run (from the project root):
- *   make unit
- * or:
- *   ./scripts/run-unit-tests.sh
+ * Build & run:   make unit
  *
  * Every check is a real assert(): a failure aborts with a file/line
- * number. The whole thing runs in a few milliseconds, so there is no
- * excuse not to run it after every change to consumer.c.
+ * number, and the whole thing runs in a few milliseconds.
  */
 #include <assert.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 
-#include "../telemetry.h"
-
+#include "consumer.c"
 /*
- * consumer.c refers to these, but they live in telemetry.c next to
- * main(). Define them here so the harness can link consumer.o without
- * dragging in main(). classify() touches none of them -- that is the
- * point of it being pure -- so the values are irrelevant.
+ * consumer.c's thread entry point refers to these; classify() does not.
+ * Defining them here lets the harness link without main() or the rest
+ * of the program.
  */
-atomic_int g_running = 1;
-atomic_int g_failed  = 0;
-stats_t    g_wait;
+queue *g_fifo;
+void   counters_count(int kind) { (void)kind; }
 
-static int g_checks = 0;
-static int g_diffs  = 0;
+static int n_checks = 0;
+static int n_diffs  = 0;
 
 static const char *kindname(int k) {
     switch (k) {
@@ -56,7 +38,7 @@ static void check(const char *js, int want, const char *name) {
     printf("  %-44s -> %-8s (want %-8s) %s\n", name, kindname(got), kindname(want),
            got == want ? "OK" : "FAIL");
     assert(got == want);
-    g_checks++;
+    n_checks++;
 }
 
 /* For cases where this implementation deliberately differs from the
@@ -68,31 +50,31 @@ static void differs(const char *js, int theirs, int ours, const char *name,
            kindname(theirs));
     printf("      %s\n", why);
     assert(got == ours);
-    g_diffs++;
+    n_diffs++;
 }
 
 int main(void) {
     printf("\n--- the three documented Jetstream kinds, well-formed ---\n");
 
     check("{\"did\":\"did:plc:x\",\"time_us\":1751500000000000,\"kind\":\"commit\","
-          "\"commit\":{\"rev\":\"a\",\"operation\":\"create\","
+        "\"commit\":{\"rev\":\"a\",\"operation\":\"create\","
           "\"collection\":\"app.bsky.feed.post\",\"record\":{\"text\":\"hello world\"}}}",
-          K_COMMIT, "well-formed commit");
+        K_COMMIT, "well-formed commit");
 
     check("{\"did\":\"did:plc:x\",\"time_us\":1,\"kind\":\"identity\","
-          "\"identity\":{\"did\":\"did:plc:x\",\"handle\":\"a.bsky.social\"}}",
-          K_IDENTITY, "well-formed identity");
+        "\"identity\":{\"did\":\"did:plc:x\",\"handle\":\"a.bsky.social\"}}",
+        K_IDENTITY, "well-formed identity");
 
     check("{\"did\":\"did:plc:x\",\"time_us\":1,\"kind\":\"account\","
-          "\"account\":{\"active\":true,\"did\":\"did:plc:x\"}}",
-          K_ACCOUNT, "well-formed account");
+        "\"account\":{\"active\":true,\"did\":\"did:plc:x\"}}",
+        K_ACCOUNT, "well-formed account");
 
     printf("\n--- a delete commit has no \"record\" field at all ---\n");
 
     check("{\"did\":\"did:plc:x\",\"time_us\":1,\"kind\":\"commit\","
-          "\"commit\":{\"rev\":\"a\",\"operation\":\"delete\","
-          "\"collection\":\"app.bsky.feed.post\",\"rkey\":\"3l3d\"}}",
-          K_COMMIT, "delete commit (no record field)");
+        "\"commit\":{\"rev\":\"a\",\"operation\":\"delete\","
+        "\"collection\":\"app.bsky.feed.post\",\"rkey\":\"3l3d\"}}",
+        K_COMMIT, "delete commit (no record field)");
 
     printf("\n--- unknown/system messages fall through to INFO ---\n");
 
@@ -108,18 +90,18 @@ int main(void) {
 
     check("{\"did\":\"did:plc:x\",\"time_us\":1,\"kind\":\"commit\","
           "\"commit\":{\"record\":{\"text\":\"lol \\\"kind\\\":\\\"identity\\\" haha\"}}}",
-          K_COMMIT, "fake kind in post text");
+        K_COMMIT, "fake kind in post text");
 
     check("{\"did\":\"did:plc:x\",\"time_us\":1,\"kind\":\"account\","
-          "\"account\":{\"active\":true},"
-          "\"extra\":{\"kind\":\"commit\"}}",
-          K_ACCOUNT, "fake kind in a nested object");
+        "\"account\":{\"active\":true},"
+        "\"extra\":{\"kind\":\"commit\"}}",
+        K_ACCOUNT, "fake kind in a nested object");
 
     /* Extra: the real kind appearing AFTER the decoy, so a naive
        first-match scan would also be wrong. */
     check("{\"commit\":{\"record\":{\"text\":\"\\\"kind\\\":\\\"identity\\\"\"}},"
-          "\"kind\":\"commit\"}",
-          K_COMMIT, "decoy before the real kind");
+        "\"kind\":\"commit\"}",
+        K_COMMIT, "decoy before the real kind");
 
     printf("\n--- case sensitivity: \"Kind\" is not \"kind\" ---\n");
     check("{\"Kind\":\"commit\"}", K_INFO, "capitalised Kind is not the field");
@@ -127,16 +109,16 @@ int main(void) {
     printf("\n--- truncated JSON ---\n");
 
     differs("{\"did\":\"did:plc:x\",\"time_us\":1751500000000000,\"kind\":\"commit\","
-            "\"commit\":{\"record\":{\"text\":\"this got cut off mid-sente",
-            K_COMMIT, K_BADJSON, "truncated mid-message",
-            "No prefix-scan fallback here, by design: this pipeline never\n"
+        "\"commit\":{\"record\":{\"text\":\"this got cut off mid-sente",
+        K_COMMIT, K_BADJSON, "truncated mid-message",
+        "No prefix-scan fallback here, by design: this pipeline never\n"
             "      enqueues truncated JSON. producer.c rejects an over-length\n"
             "      frame whole (counters_bump_oversize) rather than storing a\n"
             "      prefix, so a truncated frame can only mean genuine corruption,\n"
             "      which belongs in the badjson counter, not in a kind bucket.");
 
     differs("{\"did\":\"did:plc:x\",\"time_us\":1,\"kind\":\"identity\","
-            "\"identity\":{\"handle\":\"trunc",
+        "\"identity\":{\"handle\":\"trunc",
             K_IDENTITY, K_BADJSON, "truncated identity",
             "Same as above.");
 
@@ -156,16 +138,20 @@ int main(void) {
     }
 
     /* classify() is called once per message for 24 hours: it must not
-       leak. Run under ASan/LSan via scripts/run-unit-tests.sh. */
+       leak. LSan checks that at exit. */
     printf("\n--- 200k repeat parses (leak/stability under sanitizers) ---\n");
     for (int i = 0; i < 200000; i++) {
         const char *m = "{\"did\":\"did:plc:x\",\"kind\":\"commit\","
-                        "\"commit\":{\"record\":{\"text\":\"x\"}}}";
-        if (classify(m, strlen(m)) != K_COMMIT) { printf("  FAIL at %d\n", i); return 1; }
+            "\"commit\":{\"record\":{\"text\":\"x\"}}}";
+        if (classify(m, strlen(m)) != K_COMMIT) {
+            printf("  FAIL at %d\n", i);
+            return 1;
+        }
     }
     printf("  %-44s -> OK\n", "200000 iterations, stable");
-    g_checks++;
+    n_checks++;
 
-    printf("\n%d checks passed, %d documented differences.\n\n", g_checks, g_diffs);
+    printf("\n%d checks passed, %d documented differences.\n\n", n_checks,
+           n_diffs);
     return 0;
 }

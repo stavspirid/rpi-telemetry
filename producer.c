@@ -1,10 +1,15 @@
 /*
  * File    : producer.c
  *
- * Desc    : Thread 1. Asynchronous libwebsockets client. Every raw
- *           text frame that arrives is reassembled, timestamped and
- *           pushed into the circular buffer, then the callback
- *           returns to the network immediately.
+ * Desc    : Thread 1. Asynchronous libwebsockets client. Every raw text
+ *           frame that arrives is reassembled, timestamped and pushed
+ *           into the circular buffer, then the callback returns to the
+ *           network immediately.
+ *
+ *           Also owns the libwebsockets context: stream_init() from
+ *           main before any thread starts, stream_destroy() after they
+ *           are all joined. Nothing else in the program includes
+ *           libwebsockets.h.
  */
 
 #include <libwebsockets.h>
@@ -13,29 +18,14 @@
 
 #include "telemetry.h"
 
+unsigned long g_drops, g_oversize; /* this thread only, no lock needed */
 
-/*
- * context is written by this thread (created at startup, destroyed at
- * shutdown) and read by producer_wake(), which main and the monitor
- * call from their own threads. Without a lock the interleaving
- *   wake: reads context (non-NULL)
- *   prod: lws_context_destroy(context)
- *   wake: lws_cancel_service(<freed>)
- * is a use-after-free. ctx_lock closes that window: the destroy
- * cannot start until any in-flight wake has returned, and any wake
- * that arrives afterwards sees NULL.
- */
 static struct lws_context    *context;
-static pthread_mutex_t        ctx_lock = PTHREAD_MUTEX_INITIALIZER;
-
-static struct lws            *client_wsi;   // WebSocket instance
-static lws_sorted_usec_list_t sul_connect;  // sorted list of scheduled callbacks
+static lws_sorted_usec_list_t sul_connect; /* scheduled reconnect */
 static uint16_t               retry_count;
 
-/*
- * A single JSON message can arrive split across several CLIENT_RECEIVE calls
- * so frames are reassembled into this buffer before being enqueued
- */
+/* One JSON message can arrive split across several CLIENT_RECEIVE
+   calls, so frames are reassembled here before being enqueued. */
 static queue_entry asm_entry;
 static size_t      asm_len;
 static int         asm_overflow;
@@ -48,44 +38,42 @@ static const lws_retry_bo_t retry_policy = {
     .retry_ms_table_count = LWS_ARRAY_SIZE(backoff_ms),
     .conceal_count        = LWS_RETRY_CONCEAL_ALWAYS,
 
-    /*
-     * No traffic for 30s -> send a PING. 
-     * Still nothing 30s later -> treat the link as dead and reconnect
-     */
+    /* No traffic for 30s -> send a PING.
+       Still nothing 30s later -> treat the link as dead and reconnect. */
     .secs_since_valid_ping   = 30,
     .secs_since_valid_hangup = 60,
 
-    .jitter_percent = 20,   // Randomise the backoff +/-20%
+    .jitter_percent = 20, /* randomise the backoff +/-20% */
 };
 
 /*
  * Enqueue one completed frame.
  *
- * Locking follows assignment 1: the caller takes fifo->mut, calls
- * queueAdd, unlocks, then signals. The difference is the full case.
- * There the producer waited on notFull; here it must not, because
- * this thread IS the libwebsockets event loop and blocking it would
- * stall the socket. We drop the frame and count it instead.
+ * Locking follows assignment 1: take fifo->mut, queueAdd, unlock, then
+ * signal. The difference is the full case. There the producer waited on
+ * notFull; here it must not, because this thread IS the libwebsockets
+ * event loop and blocking it would stall the socket and lose frames at
+ * the TCP level, where they cannot be counted. Drop and count instead.
  */
-static void enqueue_frame(queue *fifo) {
+static void enqueue_frame(void) {
     int dropped = 0;
 
-    pthread_mutex_lock(fifo->mut);
+    pthread_mutex_lock(g_fifo->mut);
 
-    if (fifo->full) {
+    if (g_fifo->full) {
         dropped = 1;
     } else {
         gettimeofday(&asm_entry.enqueue_time, NULL);
         asm_entry.len = asm_len;
-        queueAdd(fifo, &asm_entry);
+        queueAdd(g_fifo, &asm_entry);
     }
 
-    pthread_mutex_unlock(fifo->mut);
+    pthread_mutex_unlock(g_fifo->mut);
 
     if (dropped)
-        counters_bump_drop();
+        g_drops++;
     else
-        pthread_cond_signal(fifo->notEmpty);
+        pthread_cond_signal(g_fifo->notEmpty);
 }
 
 static void connect_client(lws_sorted_usec_list_t *sul) {
@@ -102,24 +90,18 @@ static void connect_client(lws_sorted_usec_list_t *sul) {
     i.ssl_connection        = LCCSCF_USE_SSL;
     i.protocol              = "jetstream";
     i.local_protocol_name   = "jetstream";
-    i.pwsi                  = &client_wsi;
     i.retry_and_idle_policy = &retry_policy;
 
     if (!lws_client_connect_via_info(&i))
-        lws_retry_sul_schedule(context, 0, sul, &retry_policy,
-                               connect_client, &retry_count);
+        lws_retry_sul_schedule(context, 0, sul, &retry_policy, connect_client,
+                               &retry_count);
 }
 
 static int callback_jetstream(struct lws *wsi, enum lws_callback_reasons reason,
                               void *user, void *in, size_t len) {
-    /* The queue is handed to lws as the context user pointer, so the
-       callback does not need a global. */
-    queue *fifo = (queue *)lws_context_user(lws_get_context(wsi));
-
     (void)user;
 
     switch (reason) {
-
         case LWS_CALLBACK_CLIENT_ESTABLISHED:
             lwsl_user("jetstream: connected\n");
             retry_count  = 0;
@@ -128,24 +110,24 @@ static int callback_jetstream(struct lws *wsi, enum lws_callback_reasons reason,
             break;
 
         case LWS_CALLBACK_CLIENT_RECEIVE:
-            if (lws_is_first_fragment(wsi)) {   // start of a new frame
+            if (lws_is_first_fragment(wsi)) {       // start of a new frame
                 asm_len      = 0;
                 asm_overflow = 0;
             }
 
             if (asm_len + len < SLOTSIZE) {
-                memcpy(asm_entry.msg + asm_len, in, len);       // append to the reassembly buffer
+                memcpy(asm_entry.msg + asm_len, in, len);   // append to the reassembly buffer
                 asm_len += len;
             } else {
                 asm_overflow = 1;
             }
 
-            if (lws_is_final_fragment(wsi)) {   
+            if (lws_is_final_fragment(wsi)) {
                 if (asm_overflow) {
-                    counters_bump_oversize();
+                    g_oversize++;
                 } else {
                     asm_entry.msg[asm_len] = '\0';
-                    enqueue_frame(fifo);
+                    enqueue_frame();
                 }
                 asm_len      = 0;
                 asm_overflow = 0;
@@ -168,7 +150,6 @@ static int callback_jetstream(struct lws *wsi, enum lws_callback_reasons reason,
     return 0;
 
 reconnect:
-    client_wsi   = NULL;
     asm_len      = 0;
     asm_overflow = 0;
 
@@ -180,15 +161,13 @@ reconnect:
 
 static const struct lws_protocols protocols[] = {
     /* name, callback, per_session_data_size, rx_buffer_size, id, user,
-       tx_packet_size. A 16 KB rx buffer keeps most Jetstream messages
-       in a single fragment. */
+       tx_packet_size. A 16 KB rx buffer keeps Jetstream messages in a
+       single fragment. */
     {"jetstream", callback_jetstream, 0, 16384, 0, NULL, 0},
     {NULL, NULL, 0, 0, 0, NULL, 0}};
 
-void *producer(void *args) {
-    thread_args *targs = (thread_args *)args;
-    queue       *fifo  = targs->fifo;
-
+/* Called by main BEFORE any thread is created. */
+int stream_init(void) {
     struct lws_context_creation_info info;
 
     lws_set_log_level(LLL_ERR | LLL_WARN | LLL_USER, NULL);
@@ -198,19 +177,23 @@ void *producer(void *args) {
     info.port                = CONTEXT_PORT_NO_LISTEN;
     info.protocols           = protocols;
     info.fd_limit_per_thread = 8;
-    info.user                = fifo;
 
-    struct lws_context *ctx = lws_create_context(&info);
-    if (!ctx) {
-        lwsl_err("producer: lws_create_context failed\n");
-        g_failed  = 1;
-        g_running = 0;
-        return NULL;
-    }
+    context = lws_create_context(&info);
+    return context ? 0 : -1;
+}
 
-    pthread_mutex_lock(&ctx_lock);
-    context = ctx;
-    pthread_mutex_unlock(&ctx_lock);
+/* Wakes the event loop so the producer can see !g_running. Safe from
+   any thread for as long as the three threads are alive. */
+void stream_wake(void) { lws_cancel_service(context); }
+
+/* Called by main AFTER every thread is joined. */
+void stream_destroy(void) {
+    lws_context_destroy(context);
+    context = NULL;
+}
+
+void *producer(void *unused) {
+    (void)unused;
 
     connect_client(&sul_connect);
 
@@ -220,33 +203,16 @@ void *producer(void *args) {
      *
      * A negative return is not a dropped connection -- the retry policy
      * handles those without ever coming back here -- it means the
-     * context itself is gone. Previously the loop just ended and the
-     * thread returned, leaving g_running set: main stayed parked in
-     * sigtimedwait and the monitor kept appending 0,0,0,0 rows for the
-     * rest of the run. Fail loudly instead.
+     * context itself is gone. Fail loudly, or the monitor would keep
+     * appending 0,0,0,0 rows for the rest of the day.
      */
     while (g_running) {
-        if (lws_service(ctx, 0) < 0) {
+        if (lws_service(context, 0) < 0) {
             lwsl_err("producer: lws_service failed, aborting capture\n");
             g_failed  = 1;
             g_running = 0;
-            break;
         }
     }
 
-    /* Publish the NULL before destroying, so a concurrent
-       producer_wake() either completes first or sees NULL. */
-    pthread_mutex_lock(&ctx_lock);
-    context = NULL;
-    pthread_mutex_unlock(&ctx_lock);
-
-    lws_context_destroy(ctx);
-
     return NULL;
-}
-
-void producer_wake(void) {
-    pthread_mutex_lock(&ctx_lock);
-    if (context) lws_cancel_service(context);
-    pthread_mutex_unlock(&ctx_lock);
 }
