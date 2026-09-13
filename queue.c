@@ -4,13 +4,14 @@
 
 
 queue *queueInit(void) {
-    queue *q = (queue *)malloc(sizeof(queue)); /* ~16 MB, once, up front */
+    queue *q = (queue *)malloc(sizeof(queue)); /* ~4 MB, once, up front */
     if (!q) return NULL;
 
     q->empty = 1;
     q->full  = 0;
     q->head  = 0;
     q->tail  = 0;
+    q->peak  = 0;
 
     /*
      * Priority inheritance. The monitor runs SCHED_FIFO and briefly
@@ -47,8 +48,9 @@ void queueDelete(queue *q) {
 
 void queueAdd(queue *q, const queue_entry *in) {
     queue_entry *slot = &q->buf[q->tail];
+    long         used;
 
-    /* Copy only the bytes in use, not the whole 8 KB slot. */
+    /* Copy only the bytes in use, not the whole slot. */
     slot->len = (in->len < SLOTSIZE) ? in->len : SLOTSIZE - 1;
     memcpy(slot->msg, in->msg, slot->len + 1);
     slot->enqueue_time = in->enqueue_time;
@@ -57,6 +59,10 @@ void queueAdd(queue *q, const queue_entry *in) {
     if (q->tail == QUEUESIZE) q->tail = 0;
     if (q->tail == q->head) q->full = 1;
     q->empty = 0;
+
+    /* One compare per message, under a lock the caller already holds. */
+    used = queueCount(q);
+    if (used > q->peak) q->peak = used;
 }
 
 void queueDel(queue *q, queue_entry *out) {
@@ -78,4 +84,9 @@ long queueCount(const queue *q) {
     if (q->empty) return 0;
     if (q->tail > q->head) return q->tail - q->head;
     return QUEUESIZE - q->head + q->tail;
+}
+
+/* High-water mark since startup. Caller holds q->mut. */
+long queuePeak(const queue *q) {
+    return q->peak;
 }

@@ -9,6 +9,10 @@
  *           deadline advanced by += 1s, never "now + 1s". A late
  *           wakeup does not push the next deadline out, so error
  *           cannot accumulate: drift is zero by construction.
+ *
+ *           The one exception is an overrun, where the deadline has
+ *           already passed by the time we get to it. See the overrun
+ *           guard at the bottom of the loop.
  */
 
 #include <errno.h>
@@ -48,7 +52,10 @@ void *monitor(void *args) {
     double          occupancy;
     double          cpu_pct;
     FILE           *f;
-    long            written = 0;
+    long            written      = 0;
+    long            overruns     = 0; /* deadlines that had already passed */
+    long            skipped_secs = 0;
+    long            worst_skip   = 0;
     int             rc;
 
     set_realtime_priority();
@@ -56,7 +63,9 @@ void *monitor(void *args) {
     f = fopen(targs->log_path, "a");
     if (!f) {
         perror("monitor: fopen");
+        g_failed  = 1;
         g_running = 0;
+        producer_wake();
         return NULL;
     }
     setvbuf(f, NULL, _IOLBF, 0); /* flush on every newline */
@@ -73,7 +82,13 @@ void *monitor(void *args) {
             rc = clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &next, NULL);
         } while (rc == EINTR && g_running);
 
-        if (!g_running || rc != 0) break;
+        if (!g_running) break;
+        if (rc != 0) {
+            fprintf(stderr, "monitor: clock_nanosleep: %s\n", strerror(rc));
+            g_failed  = 1;
+            g_running = 0;
+            break;
+        }
 
         /*
          * Actual wake time. Because the ideal deadline is always a
@@ -109,9 +124,51 @@ void *monitor(void *args) {
         }
 
         next.tv_sec += 1; /* absolute deadline => zero drift */
+
+        /*
+         * Overrun guard.
+         *
+         * If the deadline we just set is ALREADY in the past -- a
+         * scheduling stall, an NTP step, a suspended process --
+         * clock_nanosleep returns instantly and the loop fires
+         * back-to-back trying to catch up. That is wrong twice over.
+         * It stamps several rows with the same Seconds value (a 4 s
+         * stall produced four rows 300 us apart, all stamped the same
+         * second, while three seconds vanished from the column). And
+         * it breaks the invariant that the ideal deadline is always a
+         * whole second -- the invariant that lets tv_nsec be read as
+         * signed jitter. A row written 3.68 s late carried
+         * tv_nsec = 682240320, which that reading turns into
+         * -317.8 ms: a large overrun plotted as a small NEGATIVE
+         * jitter, in the one plot whose whole purpose is to show it.
+         *
+         * So re-align to the next whole second in the future instead.
+         * Every row that is written then sits on the grid and its
+         * tv_nsec is true jitter; the seconds we could not sample are
+         * simply absent from the Seconds column, where post-processing
+         * can see them as a gap.
+         */
+        clock_gettime(CLOCK_REALTIME, &now);
+        if (next.tv_sec <= now.tv_sec) {
+            long skipped = (long)(now.tv_sec - next.tv_sec) + 1;
+
+            overruns++;
+            skipped_secs += skipped;
+            if (skipped > worst_skip) worst_skip = skipped;
+
+            next.tv_sec  = now.tv_sec + 1;
+            next.tv_nsec = 0;
+        }
     }
 
     fclose(f);
+
+    if (overruns)
+        fprintf(stderr,
+                "monitor: %ld deadline overrun(s), %ld second(s) skipped, "
+                "worst %ld s. Every logged row is still on the whole "
+                "second; the gaps are visible in the Seconds column.\n",
+                overruns, skipped_secs, worst_skip);
 
     /* Let main out of its wait loop if we stopped on our own. */
     producer_wake();

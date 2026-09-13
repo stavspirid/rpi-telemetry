@@ -18,6 +18,7 @@ Seconds,Nanoseconds,Commit_Count,Identity_Count,Account_Count,Info_Count,Buffer_
 | --- | --- |
 | `queue.h` / `queue.c` | Circular buffer, extended from assignment 1 |
 | `stats.c` | Welford wait-time stats, kind counters, `/proc/stat` CPU |
+
 | `producer.c` | libwebsockets client (thread 1) |
 | `consumer.c` | JSON parse and classification (thread 2) |
 | `monitor.c` | 1 Hz absolute-deadline logger (thread 3) |
@@ -67,9 +68,19 @@ the TCP level, where they cannot be counted. Instead the frame is dropped and
 every dequeue, so reverting to the blocking behaviour is a one-line change.
 
 **Slots are preallocated.** `buf[QUEUESIZE]` lives inside the `queue` struct
-as before, so one 16 MB `malloc` at startup covers the entire run. There is no
+as before, so one ~4 MB `malloc` at startup covers the entire run. There is no
 allocation on the network path at all, which is most of the "no leaks over 24
 hours" argument.
+
+**The buffer is 256 x 16 KB, not 2048 x 8 KB.** Jetstream filtered to
+`app.bsky.feed.post` runs at ~50 msg/s and the consumer turns a frame around in
+60-130 us, so 2048 slots was ~40 s of buffering for a ring that is empty
+almost all the time: `Buffer_Occupancy_Pct` read `0.00` on every single row,
+and one slot was worth 0.05%. At 256 slots one slot is 0.39%, the column can
+resolve a burst, and there is still ~5 s of absorption at the nominal rate.
+Slots went to 16 KB because 8 KB was marginal -- probing the live stream gave a
+maximum frame of 6984 B, but larger frames do occur and were being discarded
+as oversize.
 
 **Shutdown is unchanged for the consumer.** It still parks in
 `pthread_cond_wait`, is still cancelled with `pthread_cancel`, and still uses
@@ -103,7 +114,44 @@ accumulate: drift is zero by construction over any run length.
 
 **Jitter is already in the log.** The ideal deadline is always a whole second,
 so the nanoseconds field *is* the signed jitter:
-`tv_nsec < 5e8 ? tv_nsec/1e6 : (tv_nsec - 1e9)/1e6` milliseconds.
+`tv_nsec < 5e8 ? tv_nsec/1e6 : (tv_nsec - 1e9)/1e6` milliseconds. That reading
+is only valid while `|jitter| < 500 ms`, which is why the overrun guard below
+exists.
+
+**Overrun guard.** If a deadline has already passed by the time the monitor
+reaches it -- a scheduling stall, an NTP step, a suspended process -- advancing
+`next` by another second would leave it in the past too, and the loop would
+fire back-to-back to catch up. That stamps several rows with the same `Seconds`
+value and breaks the whole-second invariant the jitter reading depends on: a
+row written 3.68 s late carried `tv_nsec = 682240320`, which the formula above
+turns into **-317.8 ms**, plotting a large overrun as a small negative jitter.
+Instead the monitor re-aligns to the next whole second in the future and counts
+what it skipped (reported on stderr at exit). Every logged row then sits on the
+grid with true jitter in `tv_nsec`; the seconds that could not be sampled are
+simply absent from the `Seconds` column.
+
+*Post-processing rule:* drop any row whose `Seconds` is not exactly one greater
+than the previous row's. That row is the one that flushed the stall, so its
+counters cover several seconds and its `tv_nsec` is not meaningful jitter.
+
+**Peak occupancy is tracked separately.** `Buffer_Occupancy_Pct` is an
+instantaneous 1 Hz sample, as the assignment specifies, so it misses any burst
+that arrives and drains between two samples. `queuePeak()` updates a high-water
+mark on every enqueue and `main` prints it at exit. In one stalled test run the
+1 Hz column reported 0.39% while the true peak had been 22 slots (8.59%).
+
+**Failures are loud.** A negative return from `lws_service()` means the context
+itself is gone, not that a connection dropped (the retry policy handles those
+without ever returning here). The producer used to just end its loop and
+return, leaving `g_running` set, so `main` stayed parked in `sigtimedwait` and
+the monitor kept appending `0,0,0,0` rows for the rest of the day. Now it sets
+`g_failed`, stops the program, and `main` exits non-zero so a supervisor
+(`systemd Restart=on-failure`) can restart the capture.
+
+**`producer_wake()` is serialised against context teardown.** `context` is
+written by the producer thread and read by `producer_wake()`, which `main` and
+the monitor call from their own threads; `ctx_lock` closes the
+read-non-NULL / destroy / `lws_cancel_service(freed)` use-after-free window.
 
 **Network resilience.** `lws_retry_bo_t` gives exponential backoff
 (1/2/4/8/16 s, then 16 s forever) with 20% jitter. `secs_since_valid_ping = 30`

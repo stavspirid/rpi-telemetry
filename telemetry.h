@@ -3,6 +3,7 @@
 
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 
 #include "queue.h"
 
@@ -70,8 +71,20 @@ void *monitor(void *args);
    Safe to call from another thread. */
 void producer_wake(void);
 
-/* Defined in telemetry.c */
-extern volatile sig_atomic_t g_running;
+/* Defined in telemetry.c.
+
+   g_running was a volatile sig_atomic_t. No signal handler is ever
+   installed (signals are collected with sigtimedwait), so the
+   sig_atomic_t buys nothing, while the plain volatile access is a
+   genuine data race that ThreadSanitizer rightly reports. atomic_int
+   reads and writes with the same syntax and makes `make tsan` clean. */
+extern atomic_int g_running;
+
+/* Set by any thread that dies for a reason other than a clean stop,
+   so main can exit non-zero and a supervisor can restart the capture
+   instead of leaving it to log zeroes for the rest of the day. */
+extern atomic_int g_failed;
+
 extern stats_t g_wait; /* enqueue -> dequeue wait time, in us */
 
 #endif /* TELEMETRY_H */

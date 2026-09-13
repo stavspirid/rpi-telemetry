@@ -14,7 +14,20 @@
 #include "telemetry.h"
 
 
+/*
+ * context is written by this thread (created at startup, destroyed at
+ * shutdown) and read by producer_wake(), which main and the monitor
+ * call from their own threads. Without a lock the interleaving
+ *   wake: reads context (non-NULL)
+ *   prod: lws_context_destroy(context)
+ *   wake: lws_cancel_service(<freed>)
+ * is a use-after-free. ctx_lock closes that window: the destroy
+ * cannot start until any in-flight wake has returned, and any wake
+ * that arrives afterwards sees NULL.
+ */
 static struct lws_context    *context;
+static pthread_mutex_t        ctx_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static struct lws            *client_wsi;   // WebSocket instance
 static lws_sorted_usec_list_t sul_connect;  // sorted list of scheduled callbacks
 static uint16_t               retry_count;
@@ -187,25 +200,53 @@ void *producer(void *args) {
     info.fd_limit_per_thread = 8;
     info.user                = fifo;
 
-    context = lws_create_context(&info);
-    if (!context) {
+    struct lws_context *ctx = lws_create_context(&info);
+    if (!ctx) {
         lwsl_err("producer: lws_create_context failed\n");
+        g_failed  = 1;
         g_running = 0;
         return NULL;
     }
 
+    pthread_mutex_lock(&ctx_lock);
+    context = ctx;
+    pthread_mutex_unlock(&ctx_lock);
+
     connect_client(&sul_connect);
 
-    /* lws_service sleeps inside poll() until there is something to
-       do, so this thread burns no CPU while the stream is quiet. */
-    while (g_running && lws_service(context, 0) >= 0) {};
+    /*
+     * lws_service sleeps inside poll() until there is something to do,
+     * so this thread burns no CPU while the stream is quiet.
+     *
+     * A negative return is not a dropped connection -- the retry policy
+     * handles those without ever coming back here -- it means the
+     * context itself is gone. Previously the loop just ended and the
+     * thread returned, leaving g_running set: main stayed parked in
+     * sigtimedwait and the monitor kept appending 0,0,0,0 rows for the
+     * rest of the run. Fail loudly instead.
+     */
+    while (g_running) {
+        if (lws_service(ctx, 0) < 0) {
+            lwsl_err("producer: lws_service failed, aborting capture\n");
+            g_failed  = 1;
+            g_running = 0;
+            break;
+        }
+    }
 
-    lws_context_destroy(context);
+    /* Publish the NULL before destroying, so a concurrent
+       producer_wake() either completes first or sees NULL. */
+    pthread_mutex_lock(&ctx_lock);
     context = NULL;
+    pthread_mutex_unlock(&ctx_lock);
+
+    lws_context_destroy(ctx);
 
     return NULL;
 }
 
 void producer_wake(void) {
+    pthread_mutex_lock(&ctx_lock);
     if (context) lws_cancel_service(context);
+    pthread_mutex_unlock(&ctx_lock);
 }

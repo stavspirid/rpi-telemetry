@@ -25,8 +25,9 @@
 
 #include "telemetry.h"
 
-volatile sig_atomic_t g_running = 1;
-stats_t g_wait;       /* enqueue -> dequeue wait time, in us */
+atomic_int g_running = 1;
+atomic_int g_failed  = 0;
+stats_t    g_wait;    /* enqueue -> dequeue wait time, in us */
 
 static void usage(const char *prog) {
     fprintf(stderr,
@@ -135,11 +136,20 @@ int main(int argc, char *argv[]) {
     unsigned long parsed, drops, oversize, badjson;
     counters_totals(&parsed, &drops, &oversize, &badjson);
 
+    /* The CSV samples occupancy once a second, as specified, so it
+       misses any burst that arrives and drains in between. The
+       high-water mark does not. */
+    pthread_mutex_lock(fifo->mut);
+    long peak = queuePeak(fifo);
+    pthread_mutex_unlock(fifo->mut);
+
     stats_print(&g_wait, "Queue Wait Time (enqueue -> dequeue)", "us");
     printf("  Messages parsed  : %lu\n", parsed);
     printf("  Dropped (full)   : %lu\n", drops);
     printf("  Oversize frames  : %lu\n", oversize);
-    printf("  Malformed JSON   : %lu\n\n", badjson);
+    printf("  Malformed JSON   : %lu\n", badjson);
+    printf("  Peak buffer use  : %ld / %d slots (%.2f%%)\n\n", peak, QUEUESIZE,
+           100.0 * (double)peak / (double)QUEUESIZE);
 
     /* Cleanup */
     pthread_mutex_destroy(&g_wait.lock);
@@ -147,5 +157,7 @@ int main(int argc, char *argv[]) {
     cpu_close();
     queueDelete(fifo);
 
-    return 0;
+    /* Non-zero tells a supervisor (systemd Restart=on-failure, a shell
+       loop) that the capture aborted rather than finishing cleanly. */
+    return g_failed ? 1 : 0;
 }
