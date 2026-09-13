@@ -89,18 +89,12 @@ void counters_destroy(void) {
     pthread_mutex_destroy(&g_counters.lock);
 }
 
-void counters_count(const char *kind) {
-    int idx = K_OTHER;
-
-    if (kind) {
-        if      (strcmp(kind, "commit")   == 0) idx = K_COMMIT;
-        else if (strcmp(kind, "identity") == 0) idx = K_IDENTITY;
-        else if (strcmp(kind, "account")  == 0) idx = K_ACCOUNT;
-        else if (strcmp(kind, "info")     == 0) idx = K_INFO;
-    }
+/* kind is a K_* index, as returned by classify(). */
+void counters_count(int kind) {
+    if (kind < 0 || kind >= K_NUM) kind = K_INFO;
 
     pthread_mutex_lock(&g_counters.lock);
-    g_counters.kind[idx]++;
+    g_counters.kind[kind]++;
     g_counters.parsed++;
     pthread_mutex_unlock(&g_counters.lock);
 }

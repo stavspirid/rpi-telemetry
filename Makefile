@@ -16,6 +16,11 @@ $(TARGET): $(OBJS)
 %.o: %.c $(DEPS)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+# Unit tests for classify(), under ASan/UBSan/LSan. Milliseconds; run
+# this after every change to consumer.c.
+unit:
+	./scripts/run-unit-tests.sh
+
 # Short run to sanity-check the CSV before committing to 24 hours.
 test: $(TARGET)
 	sudo ./$(TARGET) -o /tmp/test_log.txt -d 60
@@ -35,4 +40,4 @@ memcheck: $(TARGET)
 clean:
 	rm -f $(OBJS) $(TARGET)
 
-.PHONY: all test tsan memcheck clean
+.PHONY: all unit test tsan memcheck clean

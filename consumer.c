@@ -10,9 +10,40 @@
  */
 
 #include <cjson/cJSON.h>
+#include <string.h>
 #include <sys/time.h>
 
 #include "telemetry.h"
+
+
+/*
+ * Classification, split out of the consumer loop so it can be unit
+ * tested without a queue, a socket or a thread. See
+ * tests/test_classify.c ("make unit").
+ *
+ * cJSON_GetObjectItemCaseSensitive looks only at the ROOT object, so
+ * a "kind" that appears inside a post's text, or inside any nested
+ * object, cannot be mistaken for the real one -- a whole-message
+ * strstr would get that wrong.
+ */
+int classify(const char *json, size_t len) {
+    cJSON *root = cJSON_ParseWithLength(json, len);
+    if (!root) return K_BADJSON;
+
+    /* Not one of the three data kinds => a system/error message. */
+    int idx = K_INFO;
+
+    cJSON *kind = cJSON_GetObjectItemCaseSensitive(root, "kind");
+    if (cJSON_IsString(kind) && kind->valuestring) {
+        const char *k = kind->valuestring;
+        if      (strcmp(k, "commit")   == 0) idx = K_COMMIT;
+        else if (strcmp(k, "identity") == 0) idx = K_IDENTITY;
+        else if (strcmp(k, "account")  == 0) idx = K_ACCOUNT;
+    }
+
+    cJSON_Delete(root);
+    return idx;
+}
 
 
 /* Cleanup handler: unlocks the mutex if the consumer is cancelled */
@@ -29,11 +60,10 @@ void *consumer(void *args) {
      * new scope block; variables declared inside it would be invisible
      * after pthread_cleanup_pop closes that block.
      */
-    queue_entry     entry; /* ~8 KB on the thread stack, no malloc */
+    queue_entry     entry; /* ~16 KB on the thread stack, no malloc */
     struct timeval  dequeue_time;
     double          wait_us;
-    cJSON          *root;
-    cJSON          *kind;
+    int             kind;
 
     /*
      * Deferred cancellation (the default, stated explicitly). The
@@ -75,16 +105,11 @@ void *consumer(void *args) {
          * the thread and holding the lock across it would stall both
          * the producer and the monitor.
          */
-        root = cJSON_ParseWithLength(entry.msg, entry.len);
-        if (!root) {
+        kind = classify(entry.msg, entry.len);
+        if (kind == K_BADJSON)
             counters_bump_badjson();
-            continue;
-        }
-
-        kind = cJSON_GetObjectItemCaseSensitive(root, "kind");
-        counters_count(cJSON_IsString(kind) ? kind->valuestring : NULL);
-
-        cJSON_Delete(root);
+        else
+            counters_count(kind);
     }
 
     return NULL; /* never reached */

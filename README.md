@@ -21,6 +21,7 @@ Seconds,Nanoseconds,Commit_Count,Identity_Count,Account_Count,Info_Count,Buffer_
 
 | `producer.c` | libwebsockets client (thread 1) |
 | `consumer.c` | JSON parse and classification (thread 2) |
+| `tests/test_classify.c` | Unit tests for `classify()` |
 | `monitor.c` | 1 Hz absolute-deadline logger (thread 3) |
 | `telemetry.c` | `main`: arguments, signals, thread lifecycle |
 
@@ -39,6 +40,7 @@ still runs, warns, and produces identical output with worse jitter.
 | Target | Description |
 | --- | --- |
 | `make` | Compile the binary |
+| `make unit` | `classify()` unit tests under ASan/UBSan/LSan (milliseconds) |
 | `make test` | 60-second run, prints the first lines of the CSV |
 | `make tsan` | Rebuild under ThreadSanitizer to check for races |
 | `make memcheck` | 30-second run under Valgrind |
@@ -95,6 +97,25 @@ calling `pthread_cancel` from a signal handler would not be
 async-signal-safe.
 
 ## Real-time design notes
+
+**Classification is a pure function.** `classify(json, len)` takes a buffer and
+returns a `K_*` index (or `K_BADJSON`), touching no counters, no globals and no
+I/O, so it is unit-testable without a queue, a socket or a thread --
+`make unit` runs 20 cases in milliseconds under ASan/UBSan/LSan, including
+200k repeat parses to prove it does not leak over a 24-hour run.
+`cJSON_GetObjectItemCaseSensitive` is applied to the ROOT object only, so a
+`"kind"` embedded in a post's text or in a nested object cannot be mistaken for
+the real field (a whole-message `strstr` would get that wrong).
+
+**Anything that is not commit/identity/account counts as info.** There used to
+be a `K_OTHER` bucket that nothing ever logged, so an unrecognised frame was
+silently lost. The assignment glosses the fourth counter as *info (system/error
+messages)*, which is exactly what such a frame is, so it now lands in
+`Info_Count` where it is visible. A 75 s live sample saw commit=3632,
+identity=20, account=22 and zero of anything else, so in steady state this
+changes nothing; it matters only when something unusual arrives, which is when
+the column needs to work. Unparseable input is separate and still counted as
+`badjson`.
 
 **Two independent locks.** `fifo->mut` guards the ring; `counters_t.lock`
 guards the message counters. The consumer parses JSON outside both, so the
