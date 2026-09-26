@@ -163,16 +163,9 @@ Every sample lands inside +0.03..+0.26 ms, three orders of magnitude under
 the 1 s period, with no drift over the 24h (see `accumulated drift` below) -
 `SCHED_FIFO` + `PTHREAD_PRIO_INHERIT` + `mlockall` holding the line.
 
-**`load_buffer.png`** - message rate (Hz) and ring-buffer occupancy (%) on
-a dual axis.
+**`load_buffer.png`** - message rate (Hz) and ring-buffer occupancy (%)
 
 ![load and buffer](results/plots/load_buffer.png)
-
-The Jetstream feed is bursty (mean 39.5 msg/s, peaks over 300 msg/s), and
-the buffer occupancy spikes track those bursts almost exactly, then drain
-straight back to near-zero before the next one - occupancy never exceeds
-1.56% of the 256-slot ring, so at no point in 24h did the buffer come close
-to backpressure.
 
 **`cpu_load.png`** - CPU busy % vs message rate (idle = 100 minus this).
 
@@ -180,7 +173,4 @@ to backpressure.
 
 CPU load rises with message rate, roughly linearly at low-to-moderate rate
 and flattening off at the highest rates (parsing gets more efficient in
-larger batches per wakeup). The scattered points sitting well above the
-main band at low rate are `cJSON` parses that raced a scheduler hiccup, not
-a load-dependent effect. Mean CPU is 7.6%, so even the mean-89% single-core
-spikes never approached saturation on the Zero W's one core.
+larger batches per wakeup).
