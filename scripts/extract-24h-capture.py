@@ -3,14 +3,14 @@
 
     ./scripts/extract-24h-capture.py [metrics_log.txt] [-o 24_hour_capture.txt] [--date YYYY-MM-DD]
 
-Finds the same 23:00:00 -> 22:59:59(next day) cycles that
-check-daily-cycle.py checks, picks the first COMPLETE one (or the one
+Finds the same 23:00:00 -> 22:59:59(next day) cycles.
+Picks the first COMPLETE one (or the one
 starting on --date, if given), and writes just its rows -- unchanged,
 in order -- to the output file.
 
 Refuses to extract a cycle that is truncated (log ends before 22:59:59
 the next day) or has missing seconds, since the whole point is a clean
-24h file; run check-daily-cycle.py first if that's not clear.
+24h file.
 """
 import argparse
 import sys
@@ -76,8 +76,7 @@ def main():
 
     cycles = find_complete_cycles(seconds, log_max)
     if not cycles:
-        sys.exit("no complete 23:00-anchored 24h cycle found in "
-                  f"{args.input} -- run check-daily-cycle.py to see why")
+        sys.exit(f"no complete 23:00-anchored 24h cycle found in {args.input}")
 
     if args.date:
         wanted = local_23(datetime.strptime(args.date, "%Y-%m-%d").date())
@@ -92,8 +91,7 @@ def main():
                   f"({fmt(start)}); pass --date to pick another", file=sys.stderr)
 
     if missing:
-        sys.exit(f"cycle {fmt(start)} -> {fmt(end)} has {missing} missing second(s) "
-                  "-- refusing to write a gappy file; run check-daily-cycle.py for details")
+        sys.exit(f"cycle {fmt(start)} -> {fmt(end)} has {missing} missing second(s) ")
 
     kept = [line for e, line in rows if start <= e <= end]
     with open(args.output, "w") as f:
