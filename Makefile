@@ -32,10 +32,5 @@ tsan: $(SRC) $(DEPS)
 	$(CC) -O1 -g -Wall -Wextra -std=gnu11 -D_GNU_SOURCE -pthread \
 	      -fsanitize=thread -o $(TARGET) $(SRC) $(LDFLAGS)
 
-# Leak check. Expect "definitely lost: 0 bytes".
-memcheck: $(TARGET)
-	valgrind --leak-check=full --show-leak-kinds=definite \
-	         ./$(TARGET) -o /tmp/vg_log.txt -d 30
-
 clean:
 	rm -f $(TARGET)

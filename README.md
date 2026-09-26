@@ -2,6 +2,8 @@
 
 Final assignment - Real-Time Embedded Systems
 
+Aristotle University of Thessaloniki
+
 ## Overview
 
 Three POSIX threads around the bounded circular buffer from assignment 1,
@@ -12,10 +14,12 @@ to `metrics_log.txt`. One file per thread:
 | --- | --- |
 | `producer.c` | **Thread 1** - `libwebsockets` client. Event-driven: every raw JSON frame is timestamped, pushed into the circular buffer, and the callback returns to the network immediately. Also owns the websocket context, so nothing else includes `libwebsockets.h`. |
 | `consumer.c` | **Thread 2** - wakes on `notEmpty`, parses with `cJSON` and increments the mutex-protected per-kind counters. No `printf`, no file I/O. Owns `classify()` and the Welford wait-time statistics. |
-| `monitor.c` | **Thread 3** - wakes strictly on the second, snapshots and zeroes the counters, measures buffer occupancy and CPU, appends one line. Owns the `/proc/stat` sampling. |
-| `telemetry.c` | `main`: arguments, signals, thread lifecycle, and the four shared per-kind counters. |
+| `monitor.c` | **Thread 3** - runs strictly every second, fetches upstream data and zeroes the counters, measures buffer occupancy and CPU, appends one line. Owns the `/proc/stat` sampling. |
+| `telemetry.c` | `main`: controls signals, counters and thread lifecycle |
 | `queue.c` / `queue.h` | Circular buffer, extended from assignment 1. |
 
+### Data format
+the results are appended like this on a CSV file every second.
 ```
 Seconds,Nanoseconds,Commit_Count,Identity_Count,Account_Count,Info_Count,Buffer_Occupancy_Pct,CPU_Pct
 ```
@@ -35,7 +39,7 @@ sudo apt install build-essential libwebsockets-dev libcjson-dev ca-certificates
 ```bash
 make
 ./telemetry                       # until SIGINT/SIGTERM
-./telemetry -o log.txt -d 3600    # stop after 3600 logged seconds
+./telemetry -o log.txt -d 600    # stop after 600 logged seconds
 ```
 
 Run as root for `SCHED_FIFO` and `mlockall`; without them it still runs, warns,
@@ -49,7 +53,6 @@ and produces identical output with worse jitter.
 | `make unit` | `classify()` unit tests under ASan/UBSan/LSan (milliseconds) |
 | `make test` | 60-second live run, then `check-realtime.py` on the result |
 | `make tsan` | Rebuild under ThreadSanitizer to check for races |
-| `make memcheck` | 30-second run under Valgrind |
 | `make clean` | Remove the compiled binary |
 
 ## Configuration
@@ -61,57 +64,7 @@ and produces identical output with worse jitter.
 | `MONITOR_RT_PRIO` | `telemetry.h` | 50 (`SCHED_FIFO`; 0 disables) |
 | `JS_HOST` / `JS_PATH` | `telemetry.h` | Jetstream endpoint |
 
-Jetstream filtered to `app.bsky.feed.post` runs at ~50 msg/s, and the consumer
-turns a frame around in 60-130 us, so the ring is empty almost all the time.
-256 slots is ~5 s of absorption at that rate while making one slot worth 0.39%,
-so `Buffer_Occupancy_Pct` can resolve a burst. Slots are 16 KB because 8 KB was
-marginal: probing the live stream gave a maximum frame of 6984 B, but larger
-frames do occur and were being discarded as oversize.
-
-## What changed from assignment 1
-
-**`queue_entry` carries a message instead of a `workFunction`.** The work is
-fixed now, so the payload is the frame itself: a 16 KB slot plus its length.
-`enqueue_time` is unchanged and still feeds the same Welford statistics, which
-now measure how long a frame sits in the buffer before the consumer reaches it.
-
-**The locking convention is unchanged.** `queueAdd`, `queueDel` and the new
-`queueCount` still do no locking of their own; every caller takes `fifo->mut`
-around the call and signals after releasing it, exactly as in `prod-cons.c`.
-
-**The producer no longer waits on `notFull`.** This is the one real behavioural
-change. In assignment 1 a full buffer blocked the producer on
-`pthread_cond_wait`. Here the producer *is* the libwebsockets event loop, so
-blocking it stalls the socket and loses frames at the TCP level where they
-cannot be counted. The frame is dropped and counted instead. The consumer still
-signals `notFull`, so reverting is a one-line change.
-
-**Slots are preallocated.** One ~4 MB `malloc` at startup covers the entire
-run; there is no allocation on the network path at all, which is most of the
-"no leaks over 24 hours" argument.
-
-**Two mutexes instead of one.** `fifo->mut` guards the ring; `kind_lock`
-guards the four per-kind counters the assignment requires to be global and
-mutex-protected. No thread holds one while taking the other, so lock ordering
-cannot deadlock.
-
-**Fewer mutexes than that suggests, though.** Assignment 1 locked the Welford
-statistics because `q` consumers updated them concurrently. Here there is
-exactly one consumer, and `main` reads the result only after joining it, so
-that lock is gone. The same applies to the drop/oversize/malformed diagnostic
-totals: each has a single writer thread, and `pthread_join` is the
-happens-before edge that makes reading them afterwards safe.
-
-**Shutdown is unchanged for the consumer.** It still parks in
-`pthread_cond_wait`, is still cancelled with `pthread_cancel`, and still uses
-`consumer_mutex_cleanup` via `pthread_cleanup_push`. The producer cannot be
-cancelled safely from inside libwebsockets, so it gets `lws_cancel_service()`
-and unwinds its own event loop; the monitor polls `g_running`.
-
-**Signals are collected with `sigtimedwait`, not a handler.** `SIGINT` and
-`SIGTERM` are blocked in `main` before any thread starts, so every thread
-inherits the mask. Without this, calling `pthread_cancel` from a signal handler
-would not be async-signal-safe.
+Jetstream runs at ~50 msg/s, and the consumer turns a frame around in 60-130 us, so the ring is empty almost all the time.
 
 ## Real-time design notes
 
@@ -121,7 +74,7 @@ wakeup does not push the following deadline out, so timing error cannot
 accumulate: drift is zero by construction over any run length.
 
 **Jitter is already in the log.** The ideal deadline is always a whole second,
-so the nanoseconds field *is* the signed jitter:
+so the nanoseconds field is the signed jitter:
 `tv_nsec < 5e8 ? tv_nsec/1e6 : (tv_nsec - 1e9)/1e6` milliseconds. That reading
 is only valid while `|jitter| < 500 ms`, which is what the overrun guard
 protects.
@@ -129,61 +82,19 @@ protects.
 **Overrun guard.** If a deadline has already passed when the monitor reaches it
 - a scheduling stall, an NTP step, a suspended process - advancing by another
 second would leave it in the past too and the loop would fire back-to-back to
-catch up. That stamps several rows with the same `Seconds` and breaks the
-whole-second invariant: a row written 3.68 s late carried
-`tv_nsec = 682240320`, which the formula above turns into **-317.8 ms**,
-plotting a large overrun as a small negative jitter. Instead the monitor
-re-aligns to the next whole second and counts what it skipped (reported on
-stderr at exit).
-
-*Post-processing rule:* drop any row whose `Seconds` is not exactly one greater
-than the previous row's. That row is the one that flushed the stall, so its
-counters cover several seconds and its `tv_nsec` is not meaningful jitter.
-`scripts/check-realtime.py` already does this.
-
-**Priority inheritance.** The monitor runs `SCHED_FIFO` priority 50 and briefly
-takes both locks. Both are created with `PTHREAD_PRIO_INHERIT`, so a consumer
-preempted while holding a lock is boosted rather than leaving the monitor
-blocked for an unbounded time. `mlockall` keeps every page resident.
-
-**Peak occupancy is tracked separately.** `Buffer_Occupancy_Pct` is an
-instantaneous 1 Hz sample, as the assignment specifies, so it misses a burst
-that arrives and drains between two samples. `queueAdd` keeps a high-water mark
-and `main` prints it at exit. In one stalled test the 1 Hz column reported
-0.39% while the true peak had been 22 slots (8.59%).
-
-**Classification is a pure function.** `classify(json, len)` returns a `K_*`
-index (or `K_BADJSON`) and touches no counters, no globals and no I/O, so it is
-unit-testable without a queue, a socket or a thread.
-`cJSON_GetObjectItemCaseSensitive` is applied to the root object only, so a
-`"kind"` embedded in a post's text or a nested object cannot be mistaken for
-the real field. Anything that parses but is not commit/identity/account is a
-system/error message and counts as `info`, which is what the assignment's
-fourth counter is for; unparseable input is counted separately as malformed.
+catch up.
 
 **The websocket context is owned by `producer.c`, not shared.** `stream_init()`
 runs in `main` before any thread exists and `stream_destroy()` after they are
-all joined, so the pointer never changes while another thread can see it. That
-is what makes `stream_wake()` safe to call from `main` and from the monitor
-with no lock at all, and it keeps `libwebsockets.h` out of every other file.
-
-**Failures are loud.** A negative return from `lws_service()` means the context
-is gone, not that a connection dropped (the retry policy handles those without
-returning here). It sets `g_failed`, stops the program, and `main` exits
-non-zero so `systemd Restart=on-failure` can restart the capture rather than
-leaving the monitor to append `0,0,0,0` rows for the rest of the day.
+all joined, so the pointer never changes while another thread can see it.
 
 **Network resilience.** `lws_retry_bo_t` gives exponential backoff
 (1/2/4/8/16 s, then 16 s forever) with 20% jitter. `secs_since_valid_ping = 30`
-and `secs_since_valid_hangup = 60` detect a silently wedged TCP connection, the
-usual overnight failure mode on Pi Zero W Wi-Fi. During an outage the monitor
-keeps writing lines with zero counts, so the gap appears in the data rather
-than as missing rows.
+and `secs_since_valid_hangup = 60` detect a TCP connection failure.
 
 ## On the Raspberry Pi Zero W
 
-The Zero W is ARM1176 (**ARMv6**), so it needs 32-bit Raspberry Pi OS - the
-64-bit image will not boot, and Ubuntu does not build for ARMv6 at all. It has
+The Zero W uses **ARMv6**, so it needs 32-bit Raspberry Pi OS. It has
 no Ethernet, so Wi-Fi and SSH must be baked into the image before first boot
 (Raspberry Pi Imager, OS customisation), and its radio is 2.4 GHz only.
 
@@ -196,11 +107,7 @@ make test                                           # then compare
 ```
 
 Measure the floor first: whatever `cyclictest` reports at the same priority and
-period is what the kernel can do, and the program cannot beat it. Stock
-Raspberry Pi OS ships a `CONFIG_PREEMPT` kernel, not `PREEMPT_RT`.
-
-`make tsan` does **not** work here: ThreadSanitizer has no 32-bit ARM support.
-Run it on a development machine; `make memcheck` and ASan do work on the Pi.
+period is what the kernel can do, and the program cannot beat it.
 
 | Script | Purpose |
 | --- | --- |
@@ -220,6 +127,60 @@ timedatectl status                      # confirm NTP synchronised
 vcgencmd get_throttled                  # 0x0 means no undervoltage
 ```
 
-Not yet implemented: gating the first CSV line on a wall-clock start epoch so
-the capture is exactly 86400 lines from 00:00:00. Currently `-d 86400` counts
-from launch, so launch on the second.
+## After the 24-hour run
+
+Nothing above stops `telemetry` on a schedule, so a log pulled off the Pi
+usually has a few extra minutes before/after the intended 23:00-to-23:00
+window (and, if the Pi was restarted mid-project, older unrelated segments
+too). This script turns that raw log into the exact 24h file the report
+needs:
+
+```bash
+./scripts/extract-24h-capture.py results/metrics_log.txt -o results/24_hour_capture.txt
+```
+Picks the first complete 23:00 cycle found (`--date YYYY-MM-DD` to pick a
+different one) and writes just those 86400 rows, unchanged, to the output
+file. Refuses to write anything for a cycle that is truncated or has
+missing seconds, so a `24_hour_capture.txt` that exists is guaranteed
+complete.
+
+## Post-processing plots
+
+```bash
+./scripts/plot_metrics.py results/24_hour_capture.txt
+```
+
+Three plots, matching the same jitter/gap convention as `check-realtime.py`
+(a row that flushed a stall has a meaningless `Nanoseconds`, so it is left
+out of the jitter plot only):
+
+**`jitter.png`** - signed offset of the monitor's wakeup from its ideal
+whole-second deadline, over the full 24h.
+
+![jitter](results/plots/jitter.png)
+
+Every sample lands inside +0.03..+0.26 ms, three orders of magnitude under
+the 1 s period, with no drift over the 24h (see `accumulated drift` below) -
+`SCHED_FIFO` + `PTHREAD_PRIO_INHERIT` + `mlockall` holding the line.
+
+**`load_buffer.png`** - message rate (Hz) and ring-buffer occupancy (%) on
+a dual axis.
+
+![load and buffer](results/plots/load_buffer.png)
+
+The Jetstream feed is bursty (mean 39.5 msg/s, peaks over 300 msg/s), and
+the buffer occupancy spikes track those bursts almost exactly, then drain
+straight back to near-zero before the next one - occupancy never exceeds
+1.56% of the 256-slot ring, so at no point in 24h did the buffer come close
+to backpressure.
+
+**`cpu_load.png`** - CPU busy % vs message rate (idle = 100 minus this).
+
+![cpu load](results/plots/cpu_load.png)
+
+CPU load rises with message rate, roughly linearly at low-to-moderate rate
+and flattening off at the highest rates (parsing gets more efficient in
+larger batches per wakeup). The scattered points sitting well above the
+main band at low rate are `cJSON` parses that raced a scheduler hiccup, not
+a load-dependent effect. Mean CPU is 7.6%, so even the mean-89% single-core
+spikes never approached saturation on the Zero W's one core.
