@@ -122,9 +122,14 @@ hardware RTC and the monitor sleeps on absolute `CLOCK_REALTIME` deadlines.
 
 ```bash
 sudo iw wlan0 set power_save off        # #1 cause of overnight dropouts
-sudo timedatectl set-timezone Europe/Athens
 timedatectl status                      # confirm NTP synchronised
 vcgencmd get_throttled                  # 0x0 means no undervoltage
+```
+Enable the application as a background service
+```bash
+sudo cp scripts/telemetry.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now telemetry
 ```
 
 ## After the 24-hour run
